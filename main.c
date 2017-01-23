@@ -274,6 +274,7 @@ ISR(TIMER0_OVF_vect)
       Period = GetNotePeriod(Note);
       if (Period == PAUSE_PERIOD)
       {
+        VibratoCounter = 0xFF;
         OCR1A = 0xFFFF; /* Off the output. PWM with 0 duty */
         TIMSK &= ~(1<<TOIE1); /* Выключение данного прерывания после загрузки ноты */
       }
