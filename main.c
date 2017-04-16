@@ -1,25 +1,12 @@
-#include <avr/io.h>
-#include <avr/interrupt.h> 
-#include <avr/eeprom.h>
-#include <string.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <avr/pgmspace.h>
+#include "stm8s.h"
+#include "event.h"
 
 #define NOTE_MASK 0x1F
 #define NOTE_VIBRATO 0x20
 #define NOTE_OCTAVE  0x40
 #define NOTE_SHORT   0x80
 
-#if defined(__AVR_ATmega8__)
-#define OCR1A_PIN PB1
-#else
-#define OCR1A_PIN PB3
-#define ONLY32MELODY
-#endif
-
-
-const uint8_t MelodyArray[] PROGMEM = {
+const uint8_t MelodyArray[] = {
 0xCB,0xDF,0xC8,0xDF,0xC4,0xDF,0xC0,0xDF,0xC0,0x99,0x96,0x96,0x90,0x96,0x96,0x8B,
 0xCB,0xDF,0xC8,0xDF,0xC4,0xDF,0xC0,0xDF,0xC0,0x99,0x96,0x96,0x90,0x8B,0x8B,0x8B,
 0x80,0x8B,0x8B,0x90,0x93,0x99,0x99,0x93,0x90,0x8B,0x8B,0x86,0x82,0x80,0x80,0xDF,
@@ -153,7 +140,7 @@ const uint8_t MelodyArray[] PROGMEM = {
 #endif /* 32MELODY */
 };
 
-#define CLOCK_FREQ 1000000
+#define CLOCK_FREQ 1000000 /* 1MHz */
 
 /* Длительность периода 12 нот */
 #define G_PERIOD      (uint16_t)(CLOCK_FREQ/392.00) // Соль
@@ -172,33 +159,40 @@ const uint8_t MelodyArray[] PROGMEM = {
 #define VIBRATO_STROBE (uint16_t)(CLOCK_FREQ*120.0/1000000) /* 120uS */
 
 
-#define T0_FREQ (uint16_t)(CLOCK_FREQ/8/256)
+#define T0_FREQ (uint16_t)(CLOCK_FREQ/8/256) /* Interrupt frequency */
 #define VIBRATO_INTERVAL    (uint16_t)(T0_FREQ*50.0/1000) /* 50mS */
 #define SHORT_NOTE_INTERVAL (uint16_t)(T0_FREQ*260.0/1000) /* 260mS */
 #define LONG_NOTE_INTERVAL  (uint16_t)(T0_FREQ*400.0/1000) /* 260mS */
 
 #define MELODY_MASK (sizeof(MelodyArray)/32-1)
-#define CAMERA_DELAY (uint16_t)(T0_FREQ*60)
 
 
 volatile uint16_t Period = 0;
 volatile uint16_t MelodyStart = 0; /* (0 - 63)*32 */
 volatile uint8_t  NoteNumber; /* 0 - 31 */
 volatile uint8_t  VibratoFlag; /* Next period must be increased */
-volatile uint8_t  MelodyPalaing = 0; /* The melody is plaing */
+#define MELODY_END    2
+#define MELODY_PLAING 1  /* The melody is plaing */
+volatile uint8_t  MelodyState = 0;
 volatile uint8_t  NoteLengthCounter;
 volatile uint8_t  VibratoCounter;
 uint8_t  Note;
 volatile uint8_t MelodyNumber;
-volatile uint16_t CameraDelay;
+volatile uint8_t Flag2ms;
 
-ISR(TIMER1_OVF_vect)
+/* Прерывание вызывается в начале периода при необходимости
+ перестроить параметры воспроизведения ноты */
+INTERRUPT_HANDLER(TIM1_OVR_UIF_handle,TIM1_OVR_UIF_vector)
 {
   uint16_t Tmp;
 
+  TIM1->SR1 = 0;
   /* Полпериода длительность включенного совтояния */
-  OCR1A = Period/2;
- 
+  Tmp = Period/2;
+  TIM1->CCR3H = Tmp >> 8;
+  TIM1->CCR3L = Tmp & 0xFF;
+  /* ШИМ перестроен */
+  
   /* Длительность периода - период таймера */
   /* Период уменьшается на 1/8 при включении строба вибрато */
   if (VibratoFlag)
@@ -209,11 +203,14 @@ ISR(TIMER1_OVF_vect)
   else
   {
     Tmp = Period - 1;
-    TIMSK &= ~(1<<TOIE1); /* Выключение данного прерывания после загрузки ноты */
+    TIM1->IER   = 0; /* Выключение прерывания T1 */
   }
-  ICR1 = Tmp;
+  TIM1->ARRH = Tmp >> 8;
+  TIM1->ARRL = Tmp & 0xFF;
+  /* Период перестроен */
 }
 
+/* Получение длительности периода ноты */
 static uint16_t GetNotePeriod(uint8_t _Note)
 {
   _Note = _Note & NOTE_MASK;
@@ -249,123 +246,325 @@ static uint16_t GetNotePeriod(uint8_t _Note)
 }
 
 /* Every 2mS */
-ISR(TIMER0_OVF_vect)
+INTERRUPT_HANDLER(TIM4_OVR_UIF_handler,TIM4_OVR_UIF_vector)
 {
-  if(CameraDelay)
-  {
-    CameraDelay--;
-    if (CameraDelay == 0)
-      PORTB = 0;
-  }
-  if (!MelodyPalaing)
+  TIM4->SR1 = 0;
+
+  Flag2ms++;
+  
+  /* Флаг запуска мелодии не установлен - ничего не делать */
+  if (MelodyState != MELODY_PLAING)
     return;
+
   NoteLengthCounter--;
+  /* Нота проигралась */
   if (NoteLengthCounter == 0) /* The note is end */
   {
-    if (NoteNumber < 34)
-    {
-      if (NoteNumber >= 32)
-        Note = 31;
-      else
-        Note = pgm_read_byte(MelodyArray + MelodyStart + NoteNumber);
+    if (NoteNumber < 32)
+    { 
+      {
+        uint8_t Tmp = NoteNumber;
+        Note = MelodyArray[MelodyStart + Tmp];
+        /* Получили описание ноты */
+      }
 
       NoteNumber++;
 
       Period = GetNotePeriod(Note);
       if (Period == PAUSE_PERIOD)
       {
-        VibratoCounter = 0xFF;
-        OCR1A = 0xFFFF; /* Off the output. PWM with 0 duty */
-        TIMSK &= ~(1<<TOIE1); /* Выключение данного прерывания после загрузки ноты */
+        VibratoCounter = 0xFF; // Off vibrato on pause 
+        TIM1->CCR3H = 0xFF;
+        TIM1->CCR3L = 0xFF; /* Off the output. PWM with 0 duty */
+        TIM1->IER   = 0; /* Выключение прерывания T1 */
+        /* В паузе ШИМ не будет генерироваться поскольку счетчик никогда не
+         досчитает до 0xFFFF - его период всегда меньше */
       }
       else /* Pause */
       {
         if (Note & NOTE_OCTAVE)
         {
-          Period = Period/2;
+          Period = Period/2; /* Увеличение частоты в 2 раза */
         }
         if (Note & NOTE_VIBRATO)
           VibratoCounter = VIBRATO_INTERVAL;
         else
           VibratoCounter = 0xFF;
-        TIFR = TOV1; /* Reset interrupt flag to start handler at begin of period */
-        TIMSK |= (1<<TOIE1); /* Включение прерывания T1 после загрузки ноты */
+        TIM1->SR1 = 0; /* Clear all interrupt flags */
+        TIM1->IER = TIM1_IER_UIE; /* Enable interrupt*/
+        /* Как только будет доигран период произойдет прерывание и
+          Новые настройки будут загружены в таймер в обработчике */
       } /* !Pause */
       if (Note & NOTE_SHORT)
         NoteLengthCounter = SHORT_NOTE_INTERVAL;
       else
         NoteLengthCounter = LONG_NOTE_INTERVAL;
+      /* Следующий раз в нестройку ноты мы попадем через вот этот интервал
+        == длительность ноты */
     }
     else /* End of melody */
     {
-      OCR1A = 0XFFFF; /* Off the output. PWM with 0 duty */
-      TIMSK &= ~(1<<TOIE1); /* Выключение данного прерывания после загрузки ноты */
-      MelodyPalaing = 0;
+      TIM1->CCR3H = 0xFF;
+      TIM1->CCR3L = 0xFF; /* Off the output. PWM with 0 duty */
+      TIM1->IER   = 0; /* Выключение прерывания T1 */
+      MelodyState = MELODY_END;
     }
 
     return;
   }
   if (VibratoCounter != 0xFF) /* Vibrato is on */
   {
-     VibratoCounter--;
-     if (VibratoCounter)
-       return;
-     VibratoCounter = VIBRATO_INTERVAL;
-     VibratoFlag = 1;
-     TIFR = TOV1; /* Reset interrupt flag to start handler at begin of period */
-     TIMSK |= (1<<TOIE1); /* Включение прерывания T1 после загрузки ноты */
+    VibratoCounter--;
+    if (VibratoCounter)
+      return;
+    VibratoCounter = VIBRATO_INTERVAL;
+    VibratoFlag = 1;
+    TIM1->SR1 = 0; /* Clear all interrupt flags */
+    TIM1->IER = TIM1_IER_UIE; /* Enable interrupt*/
+    /* Выбрато периодически чуть чуть уменьшает период ноты.
+      Когда наступает этот мемент включаем необходимость перестройки */
   }
 }
+
+
+#define EEPROM_SIZE 128
+uint8_t* EepRom = (uint8_t*)0x4000;
+uint8_t RandomValue;
+uint8_t FirstBit = 0;
+uint8_t NextEepRom;
+int8_t  Direction = -1;
+
+INTERRUPT_HANDLER(AWU_handler, AWU_vector)
+{
+  AWU->CSR &= ~AWU_CSR_AWUEN; /* Disable AWU  & clear interrupt flag */
+}
+
+volatile uint8_t I_Flag = 0;
+
+INTERRUPT_HANDLER(EXTI_PORTB_handler, EXTI_PORTB_vector)
+{
+  I_Flag = 1;
+  /* None */
+}
+
+
+void ReadMelodyNumber()
+{
+  uint8_t i;
+  
+  FirstBit = EepRom[1]&0x80;
+
+  for (i = 1; i < EEPROM_SIZE; i++)
+  {
+    if(FirstBit != (EepRom[i] & 0x80))
+    {
+      goto SetNext;
+    }
+    MelodyNumber = (EepRom[i] & MELODY_MASK);
+  }
+  i = 1; /* First array item */
+  FirstBit ^= 0x80;
+SetNext:
+  NextEepRom = i;
+}
+
+
+uint8_t RunNextMelody = 0;
 
 void main( void )
 {
   //Настройка входов и выходов
-  DDRD &= ~((1 << PD2) | (1 << PD6)); //Входные сигналы (кнопка, перемычка)
-  PORTD |= (1 << PD2) | (1 << PD6);   //Включить для них подтягивающие резисторы
-  DDRB  |= ((1 << PB0) | (1 << OCR1A_PIN)); //Выходы  pb1 - speaker
-  PORTB = 0;
+  GPIOC->DDR = 
+            GPIO_PIN3/* T1_CH3*/
+          |GPIO_PIN4/* T1_CH4*/;
+
+  GPIOC->CR1 = /* Push-pull */
+            GPIO_PIN3/* T1_CH3*/
+          |GPIO_PIN4/* T1_CH4*/;
+
+  GPIOB->CR1 =             
+            GPIO_PIN4/* PULLUP bell button, voltage detector*/
+          |GPIO_PIN5/* PULLUP random melody switch */;
+
+  GPIOD->ODR = GPIO_PIN4; /* power on */
+  GPIOD->DDR = GPIO_PIN3 /* T2C2 pwm */
+          |GPIO_PIN4 /* Power off */;
+  GPIOD->CR1 = GPIO_PIN3|GPIO_PIN4;
+
+  EXTI->CR1 = EXTI_CR1_PBIS; /* Прерывание по обеим перепадам порт B Нужно включать до включения прерываний */         
+
+  //Тактирование 8МГц при кварце 8МГц или без кварца.
+  { /* Clock */
+    u16 i;
+    
+    CLK->SWR = CLK_SWR_HSE; /* We will switch to HSE */
+    i=1000;
+    while(i)
+    {
+      i--;
+      if (CLK->SWCR & CLK_SWCR_SWIF) /* Interrupt flag */
+      {
+        CLK->SWCR |= CLK_SWCR_SWEN; /* Change clock source TO HSE */
+        CLK->CKDIVR = 0; /* 8Mhz external */
+        goto ClockOk;
+      }
+    }
+    /* The cristal is absent */
+    CLK->CKDIVR = CLK_CKDIVR_HSIDIV2; /* 8Mhz HSI */
+ClockOk:
+    /* Выбор периферии */
+    CLK->PCKENR1 = CLK_PCKENR1_TIM1 | CLK_PCKENR1_TIM2 | CLK_PCKENR1_TIM4;
+    CLK->PCKENR2 = CLK_PCKENR2_ADC|CLK_PCKENR2_AWU;
+    CLK->ICKR    |= CLK_ICKR_LSIEN; /* ON LSI 128K */
+  }
+  
+  ADC1->TDRL = (1<<3); /* 3-th ADC channel PD2 */
+  ADC1->CSR  = (1<<3); /* 3-th channel */
+  ADC1->CR1  = ADC1_CR1_ADON; /* 4MHz, 0n */
+  ADC1->CR2  = ADC1_CR2_ALIGN; /* Right alignment */
 
   //Настройка прерываний и таймеров
-  OCR1A = 0xFFFF; /* OFF */
-  ICR1  = 4;  /* Very fast */
+  // T1 CH3 - выходной PWM звонка
+  TIM1->ARRH = 0; 
+  TIM1->ARRL = 4; /* 4 tick period - it is wery fast */
+  TIM1->CCR3H = 0xFF;
+  TIM1->CCR3L = 0xFF; /* PWM is OFF */
+  TIM1->PSCRL = 7; /* Timer clock 1MHz */
+  TIM1->CCMR3 = TIM1_CCMR_OCM_PWM2; /* PWM2 mode */
+  TIM1->CCER2 = TIM1_CCER2_CC3E; /* Enable SCCR3 */
+  TIM1->BKR = TIM1_BKR_MOE;
+  TIM1->EGR = TIM1_EGR_UG;
 
-  TCCR1A = (1<<WGM11)|(1<<COM1A1)|(1<<COM1A0); //14 mode - fast pwm
-  TCCR1B = (1<<CS10) | (1<<WGM13) | (1<<WGM12); //Full spped - fast pwm 14 mode
- 
-  TIMSK = (1<<TOIE0);
+  //TIM4 - 2 ms периодический таймер
+  TIM4->PSCR = 6; /* 8Mhz / 2^6 (64) = 125 kHz */
+  TIM4->ARR = 0xFF; /* 125kHz/256 = 488Hz it is 2mS interrupt interval */
+  TIM4->IER = TIM4_IER_UIE; /* Update interrupt enable */
 
-#if defined(__AVR_ATmega8__)
-  TCCR0 = 
-#else
-  TCCR0B =    
-#endif
-    (1 << CS01); //Пуск таймера 0 с предделителем 8 (интерв прерыв 2 mS)
+  //TIM2 ch2 - pwm громкости
+  TIM2->ARRH = 0; 
+  TIM2->ARRL = 7; /* Всего 8 уровней громкости - 1Mhz out*/
+  TIM2->CCR2H = 0;
+  TIM2->CCR2L = EepRom[0]; /* В первом байте eeprom хранится уровень громкости */
+  TIM2->PSCR = 0; /* Timer period 1us */
+  TIM2->CCMR2 = TIM2_CCMR_OCM_PWM1; /* PWM1 mode */
+  TIM2->CCER1 = TIM2_CCER1_CC2E; /* Enable SCCR1 */
+  TIM2->EGR = TIM1_EGR_UG;
+  
+  /* Unlock the EEPROM */
+  FLASH->DUKR = 0xAE;
+  FLASH->DUKR = 0x56;
+  
+  MelodyState = 0;
+  enableInterrupts();
 
-  MelodyPalaing = 0;
-  sei (); //Глобально разрешить прерывания
+  TIM1->CR1 |= TIM1_CR1_CEN ;
+  TIM4->CR1 |= TIM4_CR1_CEN ;
+  TIM2->CR1 |= TIM2_CR1_CEN ;
 
   while (1) //
   {
-
-    //Проверка нажатия кнопки звонка
-    if ( (PIND & (1 << PD2)) == 0 &&
-      MelodyPalaing == 0 )
+    // Read adc to set random value
+    if (ADC1->CSR & ADC1_CSR_EOC)
     {
-      //Проверяем, установлена ли перемычка случайного выбора мелодии
-      if ((PIND & (1 << PD6)) == 0)
+      ADC1->CSR &= ~ADC1_CSR_EOC;
+      RandomValue += ADC1->DRL;
+      ADC1->CR1 |= ADC1_CR1_ADON; /* start */     
+    }
+
+    if(Flag2ms)
+    {
+      ADC1->CR1 |= ADC1_CR1_ADON; /* start */
+      EventKeys();
+      Flag2ms = 0;
+      while (EventQueue)
       {
-        MelodyNumber = TCNT0; //Сгенерировать случайный номер мелодии
+        RunNextMelody = 1;
+        if (EventQueue & EV_KEY_REALIZED) /* Short key pressed */
+        {
+          goto ChangeVolume;
+        }
+        if (EventQueue & EV_KEY_LONG) /* long key pressed */
+        {
+          Direction = Direction * -1;
+          goto ChangeVolume;
+        }
+
+EndChangeVolume:
+        EventQueue = 0;
+        break;
+ChangeVolume:
+        {
+          int8_t Volume = TIM2->ARRL + Direction;
+
+          if (Volume >= 0 && Volume <= 7)
+          {
+            TIM2->ARRL = Volume;
+          }
+        }
+        goto EndChangeVolume;
       }
-      else
-      {
-        MelodyNumber++;
-      }
+    }
+
+    if ( MelodyState == 0 ) /* Мелодия не включена -включить мелодию */
+    {
+      ReadMelodyNumber();
       MelodyStart = (MelodyNumber & MELODY_MASK)*32;
       NoteNumber = 0;
       NoteLengthCounter = 1;
-      CameraDelay = CAMERA_DELAY;
-      PORTB |= (1<<PB0);
-      MelodyPalaing = 1;
-    } //Завершение обработки нажатия кнопки звонка
+      MelodyState = MELODY_PLAING;
+    }
+    else if (MelodyState == MELODY_END) /* Мелодия закончилась */
+    {   
+      {
+        /* Выбрать следующую мелодию */
+        if ((GPIOD->IDR & GPIO_PIN5) == 0) /* Random melody */
+        {
+          MelodyNumber = RandomValue & MELODY_MASK;
+        }
+        else
+        {
+          MelodyNumber = (MelodyNumber+1) & MELODY_MASK;
+        }
+        /* Сохранение номера мелодии в энергонезависимой памяти */
+        /* TODO: ресурс eeprom расходуестя если работать без отключения */
+         EepRom[NextEepRom] = MelodyNumber | FirstBit;
+         if (TIM2->ARRL != EepRom[0]) /* Volume saving */
+           EepRom[0] = TIM2->ARRL;
+      }
+
+      GPIOD->ODR &= ~GPIO_PIN4; /* Выключить питание. То есть 
+          включить оптрон, который притянет затвор транзистора питания к земле */
+
+      AWU->TBR = 0x0A; /* 1010 - 2^9 */
+      AWU->APR = 0x3E; /* 64 */
+      AWU->CSR = AWU_CSR_AWUEN; /* 256 mS */
+
+      /* Ждать 256 мСек*/
+      halt();
+      AWU->CSR &= ~AWU_CSR_AWUEN; /* Disable AWU  & clear interrupt flag */
+
+      /* В этот момент питание должно отключиться кнопкой, если кнопка не нажата.
+      Если же она нажата то питание появится снова по отключению оптрона */
+      /* Включить прерывания от PB4 - детектор напряжения на трансформаторе */
+      GPIOB->CR2 = GPIO_PIN4;    
+      GPIOD->ODR = GPIO_PIN4; /* выключить оптрон. Если через кнопку проходит ток то снова появится питание трансформатора */
+      
+      /* Если пин притянут к земле, то питания нет. Если же напряжение подается постоянно - то если на этом пине напряжение, то еще звонят в звонок */
+      if (((GPIOB->IDR & GPIO_PIN4) == 0) /* этот пин притянут к земле - нет питания на трансформатора */
+          && (RunNextMelody == 0) ) /* Не была нажата ни одна клавиша во время проигрывания мелодии */
+
+      {
+        /*  Уснуть до тех пор пока не появится питание. Если конденсатор разрядится и питания не появится совсем, то программа 
+        начнет работы заново при очередном включении питания (переключении уровня на PB4) */
+        halt(); /* So the halt can wake up only by EXTI interrupt */
+//        while (I_Flag == 0);
+        //I_Flag = 0;
+      }
+      /* Если мы оказались здесь, то значит питание включилось или не выключалось вовсе */
+      GPIOB->CR2 = 0; /* Выключить прерывания от детектора напряжения */
+      MelodyState = 0; /* Продолжить воспроизведение след мелодии */
+      RunNextMelody = 0;
+      continue;
+    }
   } //while (1)
 }
