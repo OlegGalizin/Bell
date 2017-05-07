@@ -444,16 +444,12 @@ ClockOk:
   TIM2->ARRH = 0; 
   TIM2->ARRL = 7; /* Всего 8 уровней громкости - 1Mhz out*/
   TIM2->CCR2H = 0;
-  TIM2->CCR2L = EepRom[0]; /* В первом байте eeprom хранится уровень громкости */
+  TIM2->CCR2L = (EepRom[0] & 7 ); /* В первом байте eeprom хранится уровень громкости */
   TIM2->PSCR = 0; /* Timer period 1us */
   TIM2->CCMR2 = TIM2_CCMR_OCM_PWM1; /* PWM1 mode */
   TIM2->CCER1 = TIM2_CCER1_CC2E; /* Enable SCCR1 */
   TIM2->EGR = TIM1_EGR_UG;
-  
-  /* Unlock the EEPROM */
-  FLASH->DUKR = 0xAE;
-  FLASH->DUKR = 0x56;
-  
+   
   MelodyState = 0;
   enableInterrupts();
 
@@ -479,11 +475,11 @@ ClockOk:
       while (EventQueue)
       {
         RunNextMelody = 1;
-        if (EventQueue & EV_KEY_REALIZED) /* Short key pressed */
+        if ((EventQueue & EV_MASK ) == EV_KEY_REALIZED) /* Short key pressed */
         {
           goto ChangeVolume;
         }
-        if (EventQueue & EV_KEY_LONG) /* long key pressed */
+        if ((EventQueue & EV_MASK) == EV_KEY_LONG) /* long key pressed */
         {
           Direction = Direction * -1;
           goto ChangeVolume;
@@ -494,11 +490,12 @@ EndChangeVolume:
         break;
 ChangeVolume:
         {
-          int8_t Volume = TIM2->ARRL + Direction;
+          int8_t Volume = TIM2->CCR2L + Direction;
 
           if (Volume >= 0 && Volume <= 7)
           {
-            TIM2->ARRL = Volume;
+            TIM2->CCR2H = 0;
+            TIM2->CCR2L = Volume;
           }
         }
         goto EndChangeVolume;
@@ -525,25 +522,33 @@ ChangeVolume:
         {
           MelodyNumber = (MelodyNumber+1) & MELODY_MASK;
         }
+
+        /* Unlock the EEPROM */
+        FLASH->DUKR = 0xAE;
+        FLASH->DUKR = 0x56;
+        
         /* Сохранение номера мелодии в энергонезависимой памяти */
         /* TODO: ресурс eeprom расходуестя если работать без отключения */
-         EepRom[NextEepRom] = MelodyNumber | FirstBit;
-         if (TIM2->ARRL != EepRom[0]) /* Volume saving */
-           EepRom[0] = TIM2->ARRL;
+        EepRom[NextEepRom] = MelodyNumber | FirstBit;
+        if (TIM2->CCR2L != EepRom[0]) /* Volume saving */
+        {
+          EepRom[0] = TIM2->CCR2L;
+        }
+        FLASH->IAPSR = 0;
       }
 
       GPIOD->ODR &= ~GPIO_PIN4; /* Выключить питание. То есть 
           включить оптрон, который притянет затвор транзистора питания к земле */
 
-      AWU->TBR = 0x0A; /* 1010 - 2^9 */
+      AWU->TBR = 0x0B; /* 1011 - 2^10 - 512 mS */
       AWU->APR = 0x3E; /* 64 */
-      AWU->CSR = AWU_CSR_AWUEN; /* 256 mS */
+      AWU->CSR = AWU_CSR_AWUEN; 
 
-      /* Ждать 256 мСек*/
+      /* Ждать */
       halt();
       AWU->CSR &= ~AWU_CSR_AWUEN; /* Disable AWU  & clear interrupt flag */
 
-      /* В этот момент питание должно отключиться кнопкой, если кнопка не нажата.
+      /* В этот момент питание должно отключиться , если кнопка не нажата.
       Если же она нажата то питание появится снова по отключению оптрона */
       /* Включить прерывания от PB4 - детектор напряжения на трансформаторе */
       GPIOB->CR2 = GPIO_PIN4;    
